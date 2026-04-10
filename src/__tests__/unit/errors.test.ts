@@ -1,0 +1,259 @@
+import { parseAdtError, formatError, formatActivationMessages } from '../../lib/errors';
+
+describe('parseAdtError', () => {
+  describe('message extraction', () => {
+    it('from response.data.message', () => {
+      const info = parseAdtError({ response: { data: { message: 'Object not found' } } });
+      expect(info.message).toBe('Object not found');
+    });
+
+    it('from string response.data', () => {
+      const info = parseAdtError({ response: { data: 'Raw error string' } });
+      expect(info.message).toBe('Raw error string');
+    });
+
+    it('from error.message', () => {
+      const info = parseAdtError({ message: 'Connection refused' });
+      expect(info.message).toBe('Connection refused');
+    });
+
+    it('defaults to Unknown error for empty object', () => {
+      expect(parseAdtError({}).message).toBe('Unknown error');
+    });
+
+    it('defaults to Unknown error for null', () => {
+      expect(parseAdtError(null).message).toBe('Unknown error');
+    });
+
+    it('defaults to Unknown error for undefined', () => {
+      expect(parseAdtError(undefined).message).toBe('Unknown error');
+    });
+  });
+
+  describe('opaque error codes', () => {
+    it('enriches I::000', () => {
+      const info = parseAdtError({ response: { data: 'I::000' } });
+      expect(info.message).toContain('URL path is wrong');
+    });
+
+    it('enriches E::123', () => {
+      const info = parseAdtError({ response: { data: 'E::123' } });
+      expect(info.message).toContain('URL path is wrong');
+    });
+
+    it('enriches with FUGR hint', () => {
+      const info = parseAdtError({ response: { data: 'I::000' } });
+      expect(info.message).toContain('FUGR/I');
+    });
+
+    it('does not enrich normal messages', () => {
+      const info = parseAdtError({ message: 'Normal error' });
+      expect(info.message).not.toContain('URL path is wrong');
+    });
+  });
+
+  describe('L-prefix include detection', () => {
+    it('detects "This syntax cannot be used for an object name"', () => {
+      const info = parseAdtError({ message: 'This syntax cannot be used for an object name' });
+      expect(info.message).toContain('system-generated');
+      expect(info.message).toContain('FUGR/FF');
+    });
+
+    it('detects partial match "syntax cannot be used"', () => {
+      const info = parseAdtError({ message: 'The syntax cannot be used here' });
+      expect(info.message).toContain('system-generated');
+    });
+  });
+
+  describe('session timeout', () => {
+    it('detects "session timed out"', () => {
+      expect(parseAdtError({ message: 'Session timed out' }).isSessionTimeout).toBe(true);
+    });
+
+    it('detects "session not found"', () => {
+      expect(parseAdtError({ message: 'Session not found' }).isSessionTimeout).toBe(true);
+    });
+
+    it('detects "not logged on"', () => {
+      expect(parseAdtError({ message: 'Not logged on' }).isSessionTimeout).toBe(true);
+    });
+
+    it('detects HTTP 401', () => {
+      expect(parseAdtError({ response: { status: 401 } }).isSessionTimeout).toBe(true);
+    });
+
+    it('false for normal errors', () => {
+      expect(parseAdtError({ message: 'Object not found' }).isSessionTimeout).toBe(false);
+    });
+  });
+
+  describe('upgrade mode', () => {
+    it('detects "adjustment mode"', () => {
+      expect(parseAdtError({ message: 'Enhancement is in adjustment mode' }).isUpgradeMode).toBe(true);
+    });
+
+    it('detects "in adjustment"', () => {
+      expect(parseAdtError({ message: 'Object is in adjustment' }).isUpgradeMode).toBe(true);
+    });
+
+    it('detects "upgradeflag"', () => {
+      expect(parseAdtError({ message: 'upgradeFlag set' }).isUpgradeMode).toBe(true);
+    });
+
+    it('false for normal errors', () => {
+      expect(parseAdtError({ message: 'Object not found' }).isUpgradeMode).toBe(false);
+    });
+  });
+
+  describe('locked', () => {
+    it('detects "already locked"', () => {
+      expect(parseAdtError({ message: 'Object already locked' }).isLocked).toBe(true);
+    });
+
+    it('detects "locked by user"', () => {
+      expect(parseAdtError({ message: 'Locked by user PMCF' }).isLocked).toBe(true);
+    });
+
+    it('detects "enqueue" with user context', () => {
+      // "enqueue" alone is too broad — activation errors also say "enqueue".
+      // Lock is only detected when enqueue failure implies another holder.
+      expect(parseAdtError({ message: 'Enqueue failed by user PMCF' }).isLocked).toBe(true);
+      expect(parseAdtError({ message: 'Enqueue hold by another' }).isLocked).toBe(true);
+      expect(parseAdtError({ message: 'Enqueue failed' }).isLocked).toBe(false);
+    });
+
+    it('false for normal errors', () => {
+      expect(parseAdtError({ message: 'Object not found' }).isLocked).toBe(false);
+    });
+  });
+
+  describe('not found', () => {
+    it('detects HTTP 404', () => {
+      expect(parseAdtError({ response: { status: 404 } }).isNotFound).toBe(true);
+    });
+
+    it('detects "does not exist"', () => {
+      expect(parseAdtError({ message: 'Object does not exist' }).isNotFound).toBe(true);
+    });
+
+    it('detects "not found"', () => {
+      expect(parseAdtError({ message: 'Resource not found' }).isNotFound).toBe(true);
+    });
+
+    it('false for normal errors', () => {
+      expect(parseAdtError({ message: 'Syntax error' }).isNotFound).toBe(false);
+    });
+  });
+
+  describe('httpStatus', () => {
+    it('extracts from response', () => {
+      expect(parseAdtError({ response: { status: 500 } }).httpStatus).toBe(500);
+    });
+
+    it('undefined when no response', () => {
+      expect(parseAdtError({ message: 'Error' }).httpStatus).toBeUndefined();
+    });
+  });
+});
+
+describe('formatError', () => {
+  it('upgrade mode → mentions SPAU', () => {
+    const result = formatError('abap_delete(FOO)', { message: 'Enhancement is in adjustment mode' });
+    expect(result).toContain('SPAU');
+    expect(result).toContain('upgradeFlag');
+  });
+
+  it('locked → mentions SM12', () => {
+    const result = formatError('abap_set_source(FOO)', { message: 'Object already locked' });
+    expect(result).toContain('SM12');
+  });
+
+  it('not found → mentions verify name', () => {
+    const result = formatError('abap_get_source(FOO)', { response: { status: 404 } });
+    expect(result).toContain('not found');
+    expect(result).toContain('Verify');
+  });
+
+  it('generic → includes raw message', () => {
+    const result = formatError('abap_search(FOO)', { message: 'Connection reset' });
+    expect(result).toContain('Connection reset');
+  });
+
+  it('always includes operation name', () => {
+    expect(formatError('test_op', { message: 'fail' })).toContain('test_op');
+  });
+});
+
+describe('formatActivationMessages', () => {
+  it('handles empty array', () => {
+    expect(formatActivationMessages([])).toContain('no error messages');
+  });
+
+  it('handles null', () => {
+    expect(formatActivationMessages(null as any)).toContain('no error messages');
+  });
+
+  it('formats type prefix', () => {
+    const result = formatActivationMessages([{ type: 'E', shortText: 'Syntax error in line 10' }]);
+    expect(result).toContain('[E]');
+    expect(result).toContain('Syntax error');
+  });
+
+  it('adds syntax check hint', () => {
+    const result = formatActivationMessages([{ type: 'E', shortText: 'Program contains syntax errors' }]);
+    expect(result).toContain('abap_syntax_check');
+  });
+
+  it('adds inactive dependency hint', () => {
+    const result = formatActivationMessages([{ type: 'W', shortText: 'Object is not active' }]);
+    expect(result).toContain('Activate the listed dependent');
+  });
+
+  it('adds pipe/string template hint', () => {
+    const result = formatActivationMessages([{ type: 'E', shortText: 'Unmasked symbol | in string template' }]);
+    expect(result).toContain('Escape literal pipes');
+  });
+
+  it('adds locked hint', () => {
+    const result = formatActivationMessages([{ type: 'E', shortText: 'Object is locked' }]);
+    expect(result).toContain('SM12');
+  });
+
+  it('uses objDescr fallback', () => {
+    const result = formatActivationMessages([{ type: 'E', objDescr: 'ZCLAS ZCL_FOO' }]);
+    expect(result).toContain('ZCL_FOO');
+  });
+
+  it('handles non-string shortText (number)', () => {
+    const result = formatActivationMessages([{ type: 'E', shortText: 42 }]);
+    expect(result).toContain('[E]');
+    expect(result).toContain('42');
+    // Should not crash — text.toLowerCase() must work on coerced value
+  });
+
+  it('handles non-string shortText (object)', () => {
+    const result = formatActivationMessages([{ type: 'E', shortText: { msg: 'nested' } }]);
+    expect(result).toContain('[E]');
+    // Should not crash
+  });
+
+  it('handles message with no text fields (JSON fallback)', () => {
+    const result = formatActivationMessages([{ type: 'E' }]);
+    expect(result).toContain('[E]');
+  });
+
+  it('joins multiple messages with newlines', () => {
+    const result = formatActivationMessages([
+      { type: 'E', shortText: 'Error one' },
+      { type: 'W', shortText: 'Warning two' }
+    ]);
+    expect(result).toContain('Error one');
+    expect(result).toContain('Warning two');
+    expect(result.split('\n')).toHaveLength(2);
+  });
+
+  it('defaults type to E when missing', () => {
+    const result = formatActivationMessages([{ shortText: 'Something failed' }]);
+    expect(result).toContain('[E]');
+  });
+});
