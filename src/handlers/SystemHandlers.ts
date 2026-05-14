@@ -41,24 +41,6 @@ export class SystemHandlers extends BaseHandler {
         }
       },
       {
-        name: 'abap_get_transaction',
-        annotations: { readOnlyHint: true },
-        description:
-          'Get transaction code details (target program, screen, authorization object, etc.). ' +
-          'Reads the ADT virtual object for a transaction code via the VIT workbench endpoint. ' +
-          'Use this to inspect what program/screen a T-code calls, or to verify a transaction exists.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            name: {
-              type: 'string',
-              description: 'Transaction code, e.g. VA01 or /DSN/BILLING'
-            }
-          },
-          required: ['name']
-        }
-      },
-      {
         name: 'raw_http',
         description:
           'Execute a raw HTTP request to the SAP ADT API. ' +
@@ -107,11 +89,10 @@ export class SystemHandlers extends BaseHandler {
 
   async handle(toolName: string, args: any): Promise<any> {
     switch (toolName) {
-      case 'login':                  return this.handleLogin();
-      case 'healthcheck':            return this.handleHealthcheck();
-      case 'abap_get_dump':          return this.handleGetDump(args);
-      case 'abap_get_transaction':   return this.handleGetTransaction(args);
-      case 'raw_http':               return this.handleRawHttp(args);
+      case 'login':          return this.handleLogin();
+      case 'healthcheck':    return this.handleHealthcheck();
+      case 'abap_get_dump':  return this.handleGetDump(args);
+      case 'raw_http':       return this.handleRawHttp(args);
       default: throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${toolName}`);
     }
   }
@@ -183,23 +164,6 @@ export class SystemHandlers extends BaseHandler {
       return this.success({ count: dumps.length, dumps });
     } catch (error: any) {
       this.fail(`abap_get_dump failed: ${error.message || 'Unknown error'}`);
-    }
-  }
-
-  private async handleGetTransaction(args: any): Promise<any> {
-    try {
-      const h = (this.adtclient as any).h;
-      // Encode slashes for namespace T-codes like /DSN/BILLING → %2fdsn%2fbilling
-      const encoded = args.name.replace(/\//g, '%2f').toLowerCase();
-      const response = await this.withSession(() =>
-        h.request(`/sap/bc/adt/vit/wb/object_type/tran/object_name/${encoded}`, {
-          method: 'GET',
-          headers: { Accept: 'application/*' }
-        })
-      );
-      return this.success({ transaction: (response as any).body });
-    } catch (error: any) {
-      this.fail(formatError(`abap_get_transaction(${args.name})`, error));
     }
   }
 

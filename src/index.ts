@@ -26,6 +26,7 @@ import { DataHandlers }      from './handlers/DataHandlers.js';
 import { QualityHandlers }   from './handlers/QualityHandlers.js';
 import { GitHandlers }       from './handlers/GitHandlers.js';
 import { SystemHandlers }    from './handlers/SystemHandlers.js';
+import { DynproHandlers }    from './handlers/DynproHandlers.js';
 import { renderLoginPage, renderLoginSuccess } from './auth/loginPage.js';
 
 config({ path: path.resolve(__dirname, '../.env') });
@@ -109,15 +110,16 @@ export class AbapAdtServer extends Server {
   private sourceHandlers:    SourceHandlers;
   private objectHandlers:    ObjectHandlers;
   private runHandlers:       RunHandlers;
-  private transportHandlers: TransportHandlers | undefined;
+  private transportHandlers: TransportHandlers;
   private dataHandlers:      DataHandlers;
   private qualityHandlers:   QualityHandlers;
   private gitHandlers:       GitHandlers;
   private systemHandlers:    SystemHandlers;
+  private dynproHandlers:    DynproHandlers;
 
   constructor(sapUrl?: string, sapUser?: string, sapPassword?: string, sapClient?: string, sapLanguage?: string) {
     super(
-      { name: 'abap-mcp-unified', version: '3.0.0' },
+      { name: 'dassian-adt', version: '2.0.0' },
       { capabilities: { tools: {}, logging: {}, prompts: {} } }
     );
 
@@ -133,16 +135,15 @@ export class AbapAdtServer extends Server {
     this.adtClient = new ADTClient(url, user, pass, client, language);
     this.adtClient.stateful = session_types.stateful;
 
-    const enableTransport = process.env.ENABLE_TRANSPORT !== 'false'; // default: true
-
     this.sourceHandlers    = new SourceHandlers(this.adtClient);
     this.objectHandlers    = new ObjectHandlers(this.adtClient);
     this.runHandlers       = new RunHandlers(this.adtClient);
-    this.transportHandlers = enableTransport ? new TransportHandlers(this.adtClient) : undefined;
+    this.transportHandlers = new TransportHandlers(this.adtClient);
     this.dataHandlers      = new DataHandlers(this.adtClient);
     this.qualityHandlers   = new QualityHandlers(this.adtClient);
     this.gitHandlers       = new GitHandlers(this.adtClient);
     this.systemHandlers    = new SystemHandlers(this.adtClient);
+    this.dynproHandlers    = new DynproHandlers(this.adtClient, this.runHandlers);
 
     const elicitFn = (params: any) => this.elicitInput(params);
 
@@ -177,8 +178,8 @@ export class AbapAdtServer extends Server {
     return [
       this.sourceHandlers, this.objectHandlers, this.runHandlers,
       this.transportHandlers, this.dataHandlers, this.qualityHandlers,
-      this.gitHandlers, this.systemHandlers,
-    ].filter(Boolean) as Array<SourceHandlers | ObjectHandlers | RunHandlers | TransportHandlers | DataHandlers | QualityHandlers | GitHandlers | SystemHandlers>;
+      this.gitHandlers, this.systemHandlers, this.dynproHandlers,
+    ];
   }
 
   private setupHandlers() {
@@ -228,7 +229,7 @@ export class AbapAdtServer extends Server {
     const transport = new StdioServerTransport();
     await this.connect(transport);
     const clientCaps = this.getClientCapabilities();
-    console.error('abap-mcp-unified v3.0 running on stdio');
+    console.error('dassian-adt v2.0 running on stdio');
     console.error('Client capabilities:', JSON.stringify(clientCaps, null, 2));
 
     process.on('SIGINT',  async () => { await this.close(); process.exit(0); });
@@ -472,7 +473,7 @@ async function runHttp() {
   });
 
   httpServer.listen(port, () => {
-    console.error(`abap-mcp-unified v3.0 running on http://0.0.0.0:${port}${mcpPath}`);
+    console.error(`dassian-adt v2.0 running on http://0.0.0.0:${port}${mcpPath}`);
     console.error(`Login page: http://0.0.0.0:${port}/login`);
     console.error(`Health check: http://0.0.0.0:${port}/health`);
     console.error(`SAP system: ${sapUrl}`);

@@ -92,15 +92,6 @@ Namespace encoding: `/` → `%2f`, `$` → `%24`, always lowercase. Handled by `
 
 Nested types (FUGR/I, FUGR/FF) require runtime URL discovery via `searchObject` — see `resolveNestedUrl` in `BaseHandler`.
 
-### Transport Request vs Task Number (corrNr)
-
-`transport_create` returns the **request** number (e.g. D25K900183). SAP source writes (`setObjectSource`, `corrNr` param) require the **task** number (a child of the request, e.g. D25K900184). Using the request number as `corrNr` captures nothing on the transport.
-
-How each path handles this:
-- **Locked writes** (`abap_set_source`, `abap_set_class_include`): `requireTransport()` in `BaseHandler` reads `lockResult.CORRNR`, which SAP populates with the task number at lock time. This is always preferred over the caller-supplied transport.
-- **Lockless writes** (`doLocklessWrite` for DDLS/DDIC types): calls `resolveTaskNumber()` which walks `userTransports` to find the user's task on the given request.
-- **`transport_create`**: after creation, calls `resolveTaskNumber()` and includes both the request and task in its response, with an explicit hint to pass the task to downstream tools.
-
 ### Transport Release: Older System Compatibility
 
 `TransportHandlers.releaseOne(number, ignoreAtc)` wraps `adtclient.transportRelease`. Older SAP systems (S/4 2022, X22) require an XML `<tm:root>` request body in the release POST — the library sends no body. When the "expected the element" error appears, `releaseOne` retries via `h.request` with the body.

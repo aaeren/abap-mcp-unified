@@ -197,8 +197,11 @@ export class ObjectHandlers extends BaseHandler {
           if (scMatch) softwareComponent = scMatch[1];
           if (tlMatch) transportLayer = tlMatch[1];
         } catch (_) {
-          // Parent lookup failed — proceed with empty SC/TL and let SAP validate.
-          // $TMP and other local packages legitimately have no software component or transport layer.
+          // If parent lookup fails, user must provide them — fail with a clear message
+          this.fail(
+            `abap_create(${args.name}): Could not read parent package ${args.package} to derive ` +
+            `software component and transport layer. Check the package name is correct.`
+          );
         }
 
         const escDesc = (args.description || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -324,9 +327,6 @@ export class ObjectHandlers extends BaseHandler {
       );
       lockHandle = lockResult.LOCK_HANDLE;
 
-      // Transport guard: reject deletes on non-$TMP objects without a transport
-      args.transport = this.requireTransport(lockResult, args.transport, args.name);
-
       await this.withSession(async () => {
         // The library appends ?corrNr=TRANSPORT which some ADT endpoints (e.g. DDLS) reject.
         // The lock handle already encodes the transport — call DELETE directly without corrNr.
@@ -339,18 +339,6 @@ export class ObjectHandlers extends BaseHandler {
     } catch (error: any) {
       if (lockHandle) {
         try { await this.adtclient.unLock(objectUrl, lockHandle); } catch (_) {}
-      }
-      const errMsg = (error?.message || '').toLowerCase();
-      if (!args.transport && (errMsg.includes('transport') || errMsg.includes('correction') || errMsg.includes('request'))) {
-        const input = await this.elicitForm(
-          `abap_delete(${args.name}): This object requires a transport. Which transport?`,
-          { transport: { type: 'string', title: 'Transport', description: 'Transport request number (e.g. D23K900123)' } },
-          ['transport']
-        );
-        if (input?.transport) {
-          args.transport = input.transport;
-          return this.handleDelete(args);
-        }
       }
       this.fail(formatError(`abap_delete(${args.name})`, error));
     }

@@ -12,8 +12,6 @@ export interface AdtErrorInfo {
   isNotFound: boolean;
   /** True when a 400 has no meaningful body — typically a stale CSRF token or expired session. */
   isAmbiguous400: boolean;
-  /** True when the lock endpoint returns HTTP 405 — object type does not support locking (e.g. DDIC). */
-  isLockNotSupported: boolean;
   httpStatus?: number;
 }
 
@@ -102,7 +100,6 @@ export function parseAdtError(error: any): AdtErrorInfo {
       status === 404 ||
       msg.includes('does not exist') ||
       msg.includes('not found'),
-    isLockNotSupported: status === 405,
     isAmbiguous400,
     httpStatus: status,
   };

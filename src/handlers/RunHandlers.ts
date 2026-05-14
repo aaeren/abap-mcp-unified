@@ -165,6 +165,29 @@ ENDCLASS.`;
     }
 
     const className = (args.className || 'ZCL_TMP_ADT_RUN').toUpperCase();
+    const output = await this.executeAbap(args.methodBody, className, {
+      interfaceMethod: args.interfaceMethod,
+      keepClass: args.keepClass === true,
+    });
+    return this.success({ output, className });
+  }
+
+  /**
+   * Run an ABAP code snippet inside a temporary IF_OO_ADT_CLASSRUN class and return the raw stdout.
+   * Used by abap_run and by other handlers (DynproHandlers) that need to dispatch ABAP logic.
+   * Creates class in $TMP, locks → writes source → unlocks → activates → calls classrun → deletes
+   * (unless keepClass=true). Returns the raw output string written by out->write() calls.
+   */
+  public async executeAbap(
+    methodBody: string,
+    className: string,
+    opts: { interfaceMethod?: string; keepClass?: boolean } = {}
+  ): Promise<string> {
+    if (!methodBody) {
+      this.fail('executeAbap: methodBody is required.');
+    }
+
+    className = className.toUpperCase();
     const classUrl = `/sap/bc/adt/oo/classes/${className.toLowerCase()}`;
     const sourceUrl = `${classUrl}/source/main`;
 
@@ -181,8 +204,8 @@ ENDCLASS.`;
       // Auto-detect the correct interface method for this system by reading IF_OO_ADT_CLASSRUN.
       // Older systems (≤2023) use ~run; newer systems (2024+) use ~main.
       // Explicit interfaceMethod param overrides detection.
-      if (args.interfaceMethod) {
-        methodName = args.interfaceMethod.toLowerCase();
+      if (opts.interfaceMethod) {
+        methodName = opts.interfaceMethod.toLowerCase();
       } else {
         try {
           const ifSource = await this.adtclient.getObjectSource(
@@ -235,7 +258,7 @@ ENDCLASS.`;
       const lockResult = await this.adtclient.lock(classUrl);
       lockHandle = lockResult.LOCK_HANDLE;
 
-      const source = this.buildClassSource(className, args.methodBody, methodName);
+      const source = this.buildClassSource(className, methodBody, methodName);
       await this.adtclient.setObjectSource(sourceUrl, source, lockHandle);
 
       await this.adtclient.unLock(classUrl, lockHandle);
@@ -314,17 +337,19 @@ ENDCLASS.`;
         throw new Error(`classrun returned error in body (HTTP 200): ${outputStr}${hint}`);
       }
 
-      return this.success({ output, className });
+      const outStr = typeof output === 'string' ? output : JSON.stringify(output ?? '');
+      return outStr;
 
     } catch (error: any) {
       if (lockHandle) {
         try { await this.adtclient.unLock(classUrl, lockHandle); } catch (_) {}
       }
       this.fail(formatError('abap_run', error));
+      throw error; // unreachable — this.fail() is `never`, but the finally block confuses TS control flow analysis
     } finally {
       // Delete the temp class unless keepClass=true was requested.
       // Re-login first — the session may be in a bad state after an error.
-      if (classCreated && !args.keepClass) {
+      if (classCreated && !opts.keepClass) {
         try {
           this.adtclient.stateful = session_types.stateful;
           await this.adtclient.login();
