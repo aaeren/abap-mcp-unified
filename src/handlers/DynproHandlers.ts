@@ -52,6 +52,21 @@ export class DynproHandlers extends BaseHandler {
       }
     };
 
+    const containerItemSchema: any = {
+      type: 'object',
+      properties: {
+        type:       { type: 'string', enum: ['CUST_CTRL', 'TABCTRL', 'TABSTRIP', 'SUBSCR'],
+                      description: 'Container kind. CUST_CTRL=custom control area for cl_gui_*_container (most common — used to host HTML viewer / ALV / TextEdit), TABCTRL=table control, TABSTRIP=tabstrip, SUBSCR=subscreen area.' },
+        name:       { type: 'string', description: 'Container name (used by ABAP at runtime, e.g. cl_gui_custom_container( container_name = "CCON_300_HIST" )). UPPERCASE recommended.' },
+        line:       { type: 'number', description: '1-based top row.' },
+        column:     { type: 'number', description: '1-based left column.' },
+        length:     { type: 'number', description: 'Width in columns.' },
+        height:     { type: 'number', description: 'Height in rows.' },
+        element_of: { type: 'string', description: 'Parent container name. Default "SCREEN" (the auto-added root container).' }
+      },
+      required: ['type', 'name', 'line', 'column', 'length', 'height']
+    };
+
     return [
       {
         name: 'abap_dynpro_read',
@@ -77,8 +92,10 @@ export class DynproHandlers extends BaseHandler {
         description:
           'Create a new SAP dynpro. Fails with subrc=2 ALREADY_EXISTS if the screen number is already in use — ' +
           'call abap_dynpro_update for an existing screen. The mandatory SCREEN container is added automatically; ' +
-          'you only specify element fields. Element types: TEXT=label, TEMPLATE=input/output field (NOT "I/O"), ' +
-          'CHECK=checkbox, RADIO (with group1=group_name), PUSH (with push_fcode+push_ftype="E"). ' +
+          'you only specify element fields and (optionally) custom containers. Element types: TEXT=label, ' +
+          'TEMPLATE=input/output field (NOT "I/O"), CHECK=checkbox, RADIO (with group1=group_name), ' +
+          'PUSH (with push_fcode+push_ftype="E"). Use the containers array for CUST_CTRL host areas needed by ' +
+          'cl_gui_custom_container — e.g. to embed cl_gui_html_viewer, cl_gui_alv_grid, cl_gui_textedit. ' +
           'For $TMP package omit transport. flow_logic must be a list of ABAP source lines like ' +
           '["PROCESS BEFORE OUTPUT.", "  MODULE STATUS_9000.", "PROCESS AFTER INPUT.", "  MODULE USER_COMMAND_9000."].',
         annotations: { destructiveHint: false, idempotentHint: false, title: 'Dynpro create' },
@@ -89,6 +106,7 @@ export class DynproHandlers extends BaseHandler {
             dynpro_number: { type: 'string', description: '4-digit screen number to create.' },
             header:        headerSchema,
             fields:        { type: 'array', items: fieldItemSchema, description: 'List of screen elements. Empty array creates a blank screen with only the auto-added OKCODE field.' },
+            containers:    { type: 'array', items: containerItemSchema, description: 'Optional list of custom containers (CUST_CTRL etc.). Omit or pass [] for a screen with no embedded GUI controls.' },
             flow_logic:    { type: 'array', items: { type: 'string' }, description: 'PBO/PAI ABAP lines, in order. Required.' },
             transport:     { type: 'string', description: 'Transport request (omit for $TMP / local objects).' }
           },
@@ -102,7 +120,7 @@ export class DynproHandlers extends BaseHandler {
           'suppress_exist_checks="X", so this will also CREATE the screen if it does not exist — there is no ' +
           'NOT_FOUND error from SAP for this path. If you need strict "must exist" semantics, call ' +
           'abap_dynpro_read first. Same schema as abap_dynpro_create. The full screen is replaced — pass all ' +
-          'elements you want to keep, including the auto-added SCREEN container.',
+          'elements (fields + containers) you want to keep. The SCREEN root container is auto-added; do not list it.',
         annotations: { destructiveHint: true, idempotentHint: true, title: 'Dynpro update' },
         inputSchema: {
           type: 'object',
@@ -111,6 +129,7 @@ export class DynproHandlers extends BaseHandler {
             dynpro_number: { type: 'string' },
             header:        headerSchema,
             fields:        { type: 'array', items: fieldItemSchema },
+            containers:    { type: 'array', items: containerItemSchema },
             flow_logic:    { type: 'array', items: { type: 'string' } },
             transport:     { type: 'string' }
           },
@@ -212,13 +231,16 @@ export class DynproHandlers extends BaseHandler {
     const rawFields = Array.isArray(args.fields) ? args.fields : [];
     const fields = rawFields.map((f: any, i: number) => this.normalizeField(f, i, mode));
 
+    const rawContainers = Array.isArray(args.containers) ? args.containers : [];
+    const containers = rawContainers.map((c: any, i: number) => this.normalizeContainer(c, i, mode));
+
     const rawFlow = Array.isArray(args.flow_logic) ? args.flow_logic : [];
     if (rawFlow.length === 0) {
       this.fail(`abap_dynpro_${mode}: flow_logic must be a non-empty array of ABAP statement lines.`);
     }
     const flow = rawFlow.map((l: any) => String(l));
 
-    const payload = { header, fields, flow };
+    const payload = { header, fields, containers, flow };
     const b64 = Buffer.from(JSON.stringify(payload), 'utf-8').toString('base64');
     const existFlag = mode === 'update' ? 'X' : ' ';
 
@@ -291,6 +313,34 @@ export class DynproHandlers extends BaseHandler {
     if (!/^\d+$/.test(s)) this.fail(`dynpro_number must be numeric: "${s}"`);
     if (s.length > 4) this.fail(`dynpro_number must be 4 digits or less: "${s}"`);
     return s.padStart(4, '0');
+  }
+
+  private normalizeContainer(c: any, index: number, mode: string): any {
+    if (!c || typeof c !== 'object') {
+      this.fail(`abap_dynpro_${mode}: containers[${index}] must be an object.`);
+    }
+    const type = String(c.type || '').toUpperCase();
+    const ALLOWED = ['CUST_CTRL', 'TABCTRL', 'TABSTRIP', 'SUBSCR'];
+    if (!ALLOWED.includes(type)) {
+      this.fail(`abap_dynpro_${mode}: containers[${index}].type "${c.type}" not in allowed set ${ALLOWED.join(',')}.`);
+    }
+    const name = String(c.name || '').toUpperCase().trim();
+    if (!name) {
+      this.fail(`abap_dynpro_${mode}: containers[${index}] requires name.`);
+    }
+    const out = {
+      type,
+      name,
+      element_of: String(c.element_of || 'SCREEN').toUpperCase().trim(),
+      line:   Number(c.line || 0),
+      column: Number(c.column || 0),
+      length: Number(c.length || 0),
+      height: Number(c.height || 0)
+    };
+    if (out.line < 1 || out.column < 1 || out.length < 1 || out.height < 1) {
+      this.fail(`abap_dynpro_${mode}: containers[${index}] (${name}) must have line/column/length/height >= 1 (got line=${out.line}, column=${out.column}, length=${out.length}, height=${out.height}).`);
+    }
+    return out;
   }
 
   private normalizeField(f: any, index: number, mode: string): any {
@@ -486,10 +536,22 @@ out->write( |__END_DYNPRO_JSON__| ).`;
        END OF ty_fld,
        tt_fld TYPE STANDARD TABLE OF ty_fld WITH EMPTY KEY.
 
+TYPES: BEGIN OF ty_cont,
+         type       TYPE c LENGTH 10,
+         name       TYPE c LENGTH 30,
+         element_of TYPE c LENGTH 30,
+         line       TYPE i,
+         column     TYPE i,
+         length     TYPE i,
+         height     TYPE i,
+       END OF ty_cont,
+       tt_cont TYPE STANDARD TABLE OF ty_cont WITH EMPTY KEY.
+
 TYPES: BEGIN OF ty_payload,
-         header TYPE rpy_dyhead,
-         fields TYPE tt_fld,
-         flow   TYPE STANDARD TABLE OF string WITH EMPTY KEY,
+         header     TYPE rpy_dyhead,
+         fields     TYPE tt_fld,
+         containers TYPE tt_cont,
+         flow       TYPE STANDARD TABLE OF string WITH EMPTY KEY,
        END OF ty_payload.
 
 DATA lv_b64 TYPE string.
@@ -522,6 +584,19 @@ APPEND VALUE #(
   column = 0
   length = ls_payload-header-columns
   height = ls_payload-header-lines ) TO lt_cont.
+
+LOOP AT ls_payload-containers ASSIGNING FIELD-SYMBOL(<c>).
+  APPEND VALUE #(
+    type       = <c>-type
+    name       = <c>-name
+    element_of = COND #( WHEN <c>-element_of IS NOT INITIAL THEN <c>-element_of ELSE 'SCREEN' )
+    line       = <c>-line
+    column     = <c>-column
+    length     = <c>-length
+    height     = <c>-height
+    c_line_min = 1
+    c_coln_min = 1 ) TO lt_cont.
+ENDLOOP.
 
 LOOP AT ls_payload-fields ASSIGNING FIELD-SYMBOL(<src>).
   APPEND VALUE #(
