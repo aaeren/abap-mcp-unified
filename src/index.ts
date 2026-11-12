@@ -12,7 +12,7 @@ import {
   McpError,
   ErrorCode
 } from '@modelcontextprotocol/sdk/types.js';
-import { ADTClient, session_types } from 'abap-adt-api';
+import { ADTClient, session_types, createSSLConfig } from 'abap-adt-api';
 import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { randomUUID } from 'crypto';
 import path from 'path';
@@ -28,6 +28,38 @@ import { GitHandlers }       from './handlers/GitHandlers.js';
 import { SystemHandlers }    from './handlers/SystemHandlers.js';
 import { DynproHandlers }    from './handlers/DynproHandlers.js';
 import { renderLoginPage, renderLoginSuccess } from './auth/loginPage.js';
+import { SystemDef, loadRegistry, initialSystem, findSystem, describeSystem, ENV_SYSTEM_NAME } from './lib/systems.js';
+
+/** Tools that manage the connection itself — always available, even with no system connected. */
+const CONNECTION_TOOLS = [
+  {
+    name: 'sap_systems',
+    annotations: { readOnlyHint: true },
+    description:
+      'List the SAP systems this server can connect to (from the central systems file) and which one is ' +
+      'currently active. Call this when the user names a system you do not recognise, or before sap_connect.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'sap_connect',
+    annotations: { idempotentHint: true },
+    description:
+      'Switch the ACTIVE SAP system at runtime — no restart needed. Every other tool then runs against ' +
+      'this system until sap_connect is called again. Use when the user says "connect to X" / "X sistemine bağlan". ' +
+      'Logs in and returns the verified system identity (SID, client, user). Releases locks and logs out of the ' +
+      'previous system first. A system marked readOnly refuses all modifying tools.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        system: { type: 'string', description: 'System name from sap_systems (unique partial names are accepted).' }
+      },
+      required: ['system']
+    }
+  }
+];
+
+/** Modifying tools that stay usable on a readOnly system because they do not change repository state. */
+const READ_ONLY_EXEMPT = new Set(['login', 'sap_connect']);
 
 config({ path: path.resolve(__dirname, '../.env') });
 
@@ -120,23 +152,49 @@ export class AbapAdtServer extends Server {
   /** objectUrl → LOCK_HANDLE for every lock this process currently holds. See trackLocks(). */
   private readonly heldLocks = new Map<string, string>();
 
+  /** The system every tool currently runs against; undefined until sap_connect when no default exists. */
+  private activeSystem?: SystemDef;
+
   constructor(sapUrl?: string, sapUser?: string, sapPassword?: string, sapClient?: string, sapLanguage?: string) {
     super(
       { name: 'dassian-adt', version: '2.0.0' },
       { capabilities: { tools: {}, logging: {}, prompts: {} } }
     );
 
-    const url = sapUrl || process.env.SAP_URL;
-    const user = sapUser || process.env.SAP_USER;
-    const pass = sapPassword || process.env.SAP_PASSWORD;
-    const client = sapClient || process.env.SAP_CLIENT;
-    const language = sapLanguage || process.env.SAP_LANGUAGE;
+    // Explicit credentials (HTTP mode) win; otherwise pick the startup system from the registry.
+    // With neither, the server still starts — tools ask for sap_connect instead of crashing the client.
+    let initial: SystemDef | undefined;
+    if (sapUrl && sapUser && sapPassword) {
+      initial = {
+        name: ENV_SYSTEM_NAME, url: sapUrl, user: sapUser, password: sapPassword,
+        client: sapClient || process.env.SAP_CLIENT, language: sapLanguage || process.env.SAP_LANGUAGE,
+        insecureTls: process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0', source: 'env',
+      };
+    } else {
+      initial = initialSystem(loadRegistry());
+    }
 
-    if (!url) throw new Error('SAP_URL is required.');
-    if (!user || !pass) throw new Error('SAP_USER and SAP_PASSWORD are required.');
+    this.adtClient = this.buildClient(initial);
+    this.activeSystem = initial;
+    this.sourceHandlers = this.objectHandlers = this.runHandlers = this.transportHandlers = undefined as any;
+    this.dataHandlers = this.qualityHandlers = this.gitHandlers = this.systemHandlers = this.dynproHandlers = undefined as any;
+    this.buildHandlers();
 
-    this.adtClient = new ADTClient(url, user, pass, client, language);
-    this.adtClient.stateful = session_types.stateful;
+    this.setupHandlers();
+  }
+
+  /** Create an ADT client for a system (or an inert placeholder when none is connected yet). */
+  private buildClient(sys?: SystemDef): ADTClient {
+    const client = sys
+      ? new ADTClient(sys.url, sys.user, sys.password, sys.client, sys.language,
+          sys.insecureTls ? createSSLConfig(true) : undefined)
+      : new ADTClient('http://not-connected.invalid', '_NONE_', '_NONE_');
+    client.stateful = session_types.stateful;
+    return client;
+  }
+
+  /** (Re)create every handler around the current client and re-inject the server callbacks. */
+  private buildHandlers(): void {
     this.trackLocks();
 
     this.sourceHandlers    = new SourceHandlers(this.adtClient);
@@ -174,8 +232,102 @@ export class AbapAdtServer extends Server {
       handler.setNotify(notifyFn);
       handler.setSampling(samplingFn);
     }
+  }
 
-    this.setupHandlers();
+  /**
+   * Switch the active SAP system. Hands the previous session back first (locks + logout) so a
+   * switch never strands an enqueue entry on the system we are leaving.
+   */
+  private async switchSystem(sys: SystemDef | undefined, releasePrevious = true): Promise<void> {
+    if (releasePrevious && this.activeSystem) await this.releaseSapSession();
+    this.heldLocks.clear();
+    this.adtClient = this.buildClient(sys);
+    this.activeSystem = sys;
+    this.buildHandlers();
+  }
+
+  private async handleSapSystems(): Promise<any> {
+    const reg = loadRegistry();
+    return {
+      status: 'success',
+      active: this.activeSystem?.name ?? null,
+      systemsFile: reg.file,
+      ...(reg.fileExists ? {} : { note: 'Systems file not found — create it to manage systems centrally.' }),
+      ...(reg.fileError ? { fileError: reg.fileError } : {}),
+      systems: [...reg.systems.values()].map(s => describeSystem(s, this.activeSystem?.name)),
+    };
+  }
+
+  private async handleSapConnect(args: any): Promise<any> {
+    const reg = loadRegistry();
+    if (reg.fileError) throw new McpError(ErrorCode.InternalError, `Systems file is invalid — ${reg.fileError}`);
+    const { match, candidates } = findSystem(reg, String(args?.system || ''));
+    if (!match) {
+      const all = [...reg.systems.keys()].join(', ') || '(none defined)';
+      throw new McpError(ErrorCode.InvalidParams,
+        candidates.length > 1
+          ? `"${args?.system}" is ambiguous: ${candidates.join(', ')}. Pass the exact name.`
+          : `Unknown system "${args?.system}". Available: ${all}. File: ${reg.file}`);
+    }
+    if (!match.password) {
+      throw new McpError(ErrorCode.InvalidParams, `System "${match.name}" has no password configured in ${reg.file}.`);
+    }
+
+    const previous = this.activeSystem;
+    await this.switchSystem(match);
+    try {
+      await this.adtClient.login();
+    } catch (e: any) {
+      // Do not leave the session pointing at a system we could not reach: fall back to the
+      // previous one so the next tool call does not silently hit a dead connection.
+      const reason = e?.message || String(e);
+      await this.switchSystem(previous, false);
+      throw new McpError(ErrorCode.InternalError,
+        `Could not connect to "${match.name}" (${match.url}): ${reason}. ` +
+        `Active system is still: ${previous?.name ?? 'none'}.`);
+    }
+
+    // Client role straight from the system — tells a productive client apart before any write.
+    const identity: Record<string, any> = {};
+    try {
+      const q: any = await this.adtClient.runQuery(
+        "SELECT MANDT, MTEXT, CCCATEGORY FROM T000 WHERE MANDT = '" + (match.client || '').replace(/[^0-9]/g, '') + "'", 1);
+      const row: any = q?.values?.[0];
+      if (row) {
+        const roles: Record<string, string> = { P: 'PRODUCTIVE', T: 'test', C: 'customizing', D: 'demo', E: 'training', S: 'SAP reference' };
+        identity.clientText = row.MTEXT;
+        identity.clientRole = roles[row.CCCATEGORY] || row.CCCATEGORY;
+      }
+    } catch (_) { /* no authorization for T000 — identity stays partial */ }
+
+    return {
+      status: 'success',
+      connected: match.name,
+      previous: previous?.name ?? null,
+      url: match.url,
+      client: match.client,
+      user: match.user,
+      readOnly: !!match.readOnly,
+      ...identity,
+      ...(identity.clientRole === 'PRODUCTIVE' && !match.readOnly
+        ? { warning: 'This client is PRODUCTIVE and the system is not marked readOnly in the systems file.' }
+        : {}),
+    };
+  }
+
+  /** Refuse work that must not happen on the current system (none connected / readOnly). */
+  private guard(name: string, args: any, tool?: { annotations?: { readOnlyHint?: boolean } }): void {
+    if (!this.activeSystem) {
+      const names = [...loadRegistry().systems.keys()].join(', ') || '(none defined)';
+      throw new McpError(ErrorCode.InvalidRequest,
+        `No SAP system is connected. Call sap_connect first. Available systems: ${names}`);
+    }
+    if (!this.activeSystem.readOnly) return;
+    if (tool?.annotations?.readOnlyHint || READ_ONLY_EXEMPT.has(name)) return;
+    if (name === 'raw_http' && String(args?.method || '').toUpperCase() === 'GET') return;
+    throw new McpError(ErrorCode.InvalidRequest,
+      `System "${this.activeSystem.name}" is readOnly — "${name}" is refused. ` +
+      `Change readOnly in the systems file if writes are intended.`);
   }
 
   private allHandlers() {
@@ -188,7 +340,7 @@ export class AbapAdtServer extends Server {
 
   private setupHandlers() {
     this.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: this.allHandlers().flatMap(h => h.getTools())
+      tools: [...CONNECTION_TOOLS, ...this.allHandlers().flatMap(h => h.getTools())]
     }));
 
     this.setRequestHandler(ListPromptsRequestSchema, async () => ({
@@ -205,12 +357,26 @@ export class AbapAdtServer extends Server {
     this.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
 
+      if (name === 'sap_systems' || name === 'sap_connect') {
+        const data = name === 'sap_systems' ? await this.handleSapSystems() : await this.handleSapConnect(args);
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      }
+
       for (const handler of this.allHandlers()) {
-        const tools = handler.getTools().map(t => t.name);
-        if (tools.includes(name)) {
+        const tool = handler.getTools().find(t => t.name === name);
+        if (tool) {
+          this.guard(name, args, tool);
+          const system = this.activeSystem!.name;
           try {
             const result = await handler.validateAndHandle(name, args || {});
-            if (result?.content) return result;
+            if (result?.content) {
+              // Stamp every modifying call with the system it ran on, so a write to the wrong
+              // system is visible in the very response that performed it.
+              if (!tool.annotations?.readOnlyHint && Array.isArray(result.content)) {
+                result.content.push({ type: 'text', text: `[sap system: ${system}]` });
+              }
+              return result;
+            }
             return {
               content: [{
                 type: 'text',
@@ -602,7 +768,7 @@ const mode = process.env.MCP_TRANSPORT || 'stdio';
 if (mode === 'http') {
   runHttp().catch(console.error);
 } else {
-  // Stdio mode — requires SAP_USER + SAP_PASSWORD in env
+  // Stdio mode — system comes from SAP_* env, the systems file default, or a later sap_connect
   const server = new AbapAdtServer();
   server.runStdio().catch(console.error);
 }

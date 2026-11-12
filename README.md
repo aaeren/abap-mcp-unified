@@ -224,3 +224,31 @@ Contributions are welcome. Please:
 ## License
 
 MIT -- see [LICENSE](LICENSE).
+
+## Multiple SAP systems, one server (runtime switching)
+
+Keep every system in ONE file outside your project repos — default `~/.sap-mcp/systems.json`
+(override with `SAP_SYSTEMS_FILE`) — and register the server once at user level:
+
+```json
+{
+  "defaultSystem": "dev",
+  "systems": {
+    "dev": { "url": "https://host:44300", "client": "100", "user": "ME", "password": "...",
+             "language": "EN", "insecureTls": true },
+    "prd": { "url": "https://prd:44300", "client": "100", "user": "ME", "password": "env:PRD_PW",
+             "readOnly": true }
+  }
+}
+```
+
+- `sap_systems` — list systems and the active one (passwords are never returned).
+- `sap_connect { system }` — switch the active system **without restarting the client**. Releases
+  locks and logs out of the previous system, logs in, and returns client text/role (warns on a
+  productive client that is not marked `readOnly`). If the login fails the previous system stays active.
+- `readOnly: true` refuses every tool not annotated read-only (and non-GET `raw_http`).
+- `insecureTls: true` accepts self-signed certificates for that system only.
+- Every modifying tool response ends with `[sap system: <name>]`.
+- Startup system: `SAP_SYSTEM` env → legacy `SAP_URL/SAP_USER/SAP_PASSWORD` env → `defaultSystem` →
+  none (tools then ask for `sap_connect`). Existing single-system `.mcp.json` setups keep working.
+- The file is re-read on every `sap_systems` / `sap_connect`, so edits apply immediately.
