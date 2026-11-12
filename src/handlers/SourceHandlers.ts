@@ -446,13 +446,18 @@ export class SourceHandlers extends BaseHandler {
     };
 
     try {
-      // Retry up to twice if locked by another session (stale locks clear within seconds).
+      // Retry if locked by another session. Orphaned locks (from a stateful ADT session that
+      // died mid-write, e.g. right after abap_create's own internal lock/write/unlock) can take
+      // much longer than a few seconds for SAP's own session cleanup to reap — observed in
+      // practice to take minutes, not seconds. Escalating backoff up to ~90s total covers that
+      // without requiring manual SM04/SM12 intervention.
       // Use abap_unlock to force-release if retries all fail.
       let lastError: any;
-      for (let i = 0; i < 3; i++) {
-        const delay = [0, 3000, 8000][i];
+      const delays = [0, 3000, 8000, 20000, 40000];
+      for (let i = 0; i < delays.length; i++) {
+        const delay = delays[i];
         if (delay > 0) {
-          await this.notify(`Object locked — waiting ${delay / 1000}s before retry (attempt ${i + 1}/3)…`, 'warning');
+          await this.notify(`Object locked — waiting ${delay / 1000}s before retry (attempt ${i + 1}/${delays.length})…`, 'warning');
           await new Promise(r => setTimeout(r, delay));
         }
         try {
@@ -533,10 +538,11 @@ export class SourceHandlers extends BaseHandler {
 
     try {
       let lastError: any;
-      for (let i = 0; i < 3; i++) {
-        const delay = [0, 3000, 8000][i];
+      const delays = [0, 3000, 8000, 20000, 40000];
+      for (let i = 0; i < delays.length; i++) {
+        const delay = delays[i];
         if (delay > 0) {
-          await this.notify(`Object locked — waiting ${delay / 1000}s before retry (attempt ${i + 1}/3)…`, 'warning');
+          await this.notify(`Object locked — waiting ${delay / 1000}s before retry (attempt ${i + 1}/${delays.length})…`, 'warning');
           await new Promise(r => setTimeout(r, delay));
         }
         try {

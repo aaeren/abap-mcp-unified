@@ -117,6 +117,9 @@ export class AbapAdtServer extends Server {
   private systemHandlers:    SystemHandlers;
   private dynproHandlers:    DynproHandlers;
 
+  /** objectUrl → LOCK_HANDLE for every lock this process currently holds. See trackLocks(). */
+  private readonly heldLocks = new Map<string, string>();
+
   constructor(sapUrl?: string, sapUser?: string, sapPassword?: string, sapClient?: string, sapLanguage?: string) {
     super(
       { name: 'dassian-adt', version: '2.0.0' },
@@ -134,6 +137,7 @@ export class AbapAdtServer extends Server {
 
     this.adtClient = new ADTClient(url, user, pass, client, language);
     this.adtClient.stateful = session_types.stateful;
+    this.trackLocks();
 
     this.sourceHandlers    = new SourceHandlers(this.adtClient);
     this.objectHandlers    = new ObjectHandlers(this.adtClient);
@@ -224,6 +228,88 @@ export class AbapAdtServer extends Server {
     });
   }
 
+  /**
+   * Wrap lock/unLock on the shared client so the server always knows which objects it holds.
+   *
+   * Without this, closing the Claude Code window leaves any in-flight lock on SAP's enqueue
+   * server until SAP's own session reaper runs — minutes later. The next session then hits
+   * "object is locked by user X" where X is the same developer. Wrapping the client instead of
+   * each call site means no lock path can be missed (ObjectHandlers, RunHandlers, SourceHandlers
+   * all lock directly on adtclient).
+   *
+   * deleteObject is wrapped too: a delete releases its lock implicitly, so the entry must be
+   * forgotten or shutdown would try to unlock an object that no longer exists.
+   */
+  private trackLocks(): void {
+    const client = this.adtClient as any;
+    const origLock = client.lock.bind(client);
+    const origUnlock = client.unLock.bind(client);
+    const origDelete = client.deleteObject.bind(client);
+
+    client.lock = async (objectUrl: string, accessMode?: string) => {
+      const result = await origLock(objectUrl, accessMode);
+      if (result?.LOCK_HANDLE) this.heldLocks.set(objectUrl, result.LOCK_HANDLE);
+      return result;
+    };
+
+    // Only forget the lock when the unlock actually succeeded. A failed unLock (dead session)
+    // means the enqueue entry is still out there — keep it so shutdown gets one more attempt
+    // on a freshly logged-in session.
+    client.unLock = async (objectUrl: string, lockHandle: string) => {
+      const result = await origUnlock(objectUrl, lockHandle);
+      this.heldLocks.delete(objectUrl);
+      return result;
+    };
+
+    client.deleteObject = async (objectUrl: string, lockHandle: string, transport?: string) => {
+      const result = await origDelete(objectUrl, lockHandle, transport);
+      this.heldLocks.delete(objectUrl);
+      return result;
+    };
+  }
+
+  /**
+   * Hand the SAP session back before the process exits: release outstanding locks, then log out.
+   *
+   * The logout is the important half. MCP's close() only tears down the stdio transport — the
+   * stateful ICM session stays alive on SAP, and an ADT lock is bound to that session, not just
+   * to the enqueue table. That is why a lock can survive even after SM12 looks clean.
+   */
+  private async releaseSapSession(): Promise<void> {
+    if (this.heldLocks.size > 0) {
+      // Re-login stateful first: the lock handles are only valid inside a live stateful session,
+      // and whatever killed the previous one is often why we still hold these.
+      try {
+        this.adtClient.stateful = session_types.stateful;
+        await this.adtClient.login();
+      } catch (_) { /* best-effort — try the unlocks anyway */ }
+
+      for (const [objectUrl, lockHandle] of this.heldLocks) {
+        try {
+          await this.adtClient.unLock(objectUrl, lockHandle);
+          console.error(`[SHUTDOWN] released lock on ${objectUrl}`);
+        } catch (e: any) {
+          console.error(`[SHUTDOWN] could not release lock on ${objectUrl}: ${e?.message || e} ` +
+            `— use abap_unlock on the next session if it stays blocked`);
+        }
+      }
+      this.heldLocks.clear();
+    }
+
+    try {
+      await this.adtClient.logout();
+      console.error('[SHUTDOWN] SAP session ended');
+    } catch (e: any) {
+      console.error(`[SHUTDOWN] logout failed: ${e?.message || e}`);
+    }
+  }
+
+  /** MCP Server.close(), extended to end the SAP session instead of abandoning it. */
+  async close(): Promise<void> {
+    await this.releaseSapSession();
+    await super.close();
+  }
+
   /** Run in stdio mode (default). Requires SAP_USER/SAP_PASSWORD in env. */
   async runStdio() {
     const transport = new StdioServerTransport();
@@ -232,8 +318,29 @@ export class AbapAdtServer extends Server {
     console.error('dassian-adt v2.0 running on stdio');
     console.error('Client capabilities:', JSON.stringify(clientCaps, null, 2));
 
-    process.on('SIGINT',  async () => { await this.close(); process.exit(0); });
-    process.on('SIGTERM', async () => { await this.close(); process.exit(0); });
+    // Shut down cleanly on every route the client can take us down by. On Windows, Claude Code
+    // usually ends a stdio server by closing our stdin rather than signalling, so 'end' matters
+    // at least as much as SIGINT/SIGTERM here. Guarded against re-entry and against a hung
+    // network call — a stuck logout must not stop the process from exiting.
+    let shuttingDown = false;
+    const shutdown = async () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      try {
+        await Promise.race([
+          this.close(),
+          new Promise(resolve => setTimeout(resolve, 5000)),
+        ]);
+      } catch (e: any) {
+        console.error(`[SHUTDOWN] ${e?.message || e}`);
+      }
+      process.exit(0);
+    };
+
+    process.on('SIGINT',  shutdown);
+    process.on('SIGTERM', shutdown);
+    process.stdin.on('end', shutdown);
+    process.stdin.on('close', shutdown);
   }
 }
 

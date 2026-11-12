@@ -12,10 +12,12 @@ export class RunHandlers extends BaseHandler {
         description:
           'Release the ABAP enqueue lock (SM12) for an object. Use when abap_set_source or ' +
           'abap_edit_method fails because a previous MCP operation crashed before unlocking. ' +
-          'Calls the appropriate DEQUEUE FM. Only affects locks held by the current SAP user. ' +
-          'LIMITATION: clears the enqueue lock (SM12) only — NOT the ICM HTTP session lock. ' +
-          'If the object is still blocked after this, a stale ICM session holds the ADT lock: ' +
-          'kill it in SM04 (delete work process entries for this user showing the ADT class path). ' +
+          'Establishes a fresh SAP session first, calls the appropriate DEQUEUE FM, then does what ' +
+          'SM12 does: reads the remaining enqueue entries and deletes the ones held by the current ' +
+          'SAP user — this is what clears a lock orphaned by a session that no longer exists. ' +
+          'Locks held by OTHER users are reported but never deleted. ' +
+          'If the object is still blocked afterwards, a live ICM session holds the ADT lock: ' +
+          'close any other Claude Code window connected to this system, or kill the session in SM04. ' +
           'Supported types: CLAS, INTF, PROG, FUGR.',
         inputSchema: {
           type: 'object',
@@ -123,15 +125,89 @@ export class RunHandlers extends BaseHandler {
       );
     }
 
-    const methodBody =
+    // Reset the session before doing anything else. A poisoned session is the usual reason we are
+    // called at all, and handleRun would otherwise create ZCL_TMP_UNLOCK on that same broken
+    // session and fail exactly the way the original write did.
+    try { await this.adtclient.dropSession(); } catch (_) {}
+    try {
+      this.adtclient.stateful = session_types.stateful;
+      await this.adtclient.login();
+    } catch (e: any) {
+      this.fail(`abap_unlock: could not establish a fresh SAP session — ${e?.message || e}`);
+    }
+
+    const dequeueBlock =
       `TRY.\n` +
       `  ${template!(name).split('\n').join('\n  ')}\n` +
-      `  out->write( |abap_unlock: DEQUEUE FM called for '${name}'. Enqueue lock (SM12) cleared. If object still blocked, a stale ICM session in SM04 holds the ADT lock.| ).\n` +
+      `  out->write( |dequeue: FM called for '${name}'| ).\n` +
       `CATCH cx_root INTO DATA(lx).\n` +
-      `  out->write( |abap_unlock failed: { lx->get_text( ) }| ).\n` +
+      `  out->write( |dequeue failed: { lx->get_text( ) }| ).\n` +
       `ENDTRY.`;
 
-    return this.handleRun({ methodBody, className: 'ZCL_TMP_UNLOCK' });
+    // Preferred variant: after the DEQUEUE, do what SM12 does — read the remaining enqueue
+    // entries and delete the ones this user owns. DEQUEUE alone cannot clear an entry left behind
+    // by a session that is already gone, which is the case that keeps blocking writes.
+    //
+    // Locks held by OTHER users are reported but never deleted — that is someone else's work in
+    // progress. We scan all lock objects and match on GARG rather than guessing the GNAME per
+    // object type, since GNAME differs per type and is easy to get wrong.
+    const enqueueBlock =
+      `DATA: lt_enq TYPE STANDARD TABLE OF seqg3,\n` +
+      `      lt_del TYPE STANDARD TABLE OF seqg3,\n` +
+      `      lv_num TYPE i,\n` +
+      `      lv_subrc TYPE i.\n` +
+      `CALL FUNCTION 'ENQUEUE_READ'\n` +
+      `  EXPORTING\n` +
+      `    gclient = sy-mandt\n` +
+      `    gname   = space\n` +
+      `    garg    = space\n` +
+      `    guname  = space\n` +
+      `  IMPORTING\n` +
+      `    number  = lv_num\n` +
+      `  TABLES\n` +
+      `    enq     = lt_enq.\n` +
+      `LOOP AT lt_enq INTO DATA(ls_enq).\n` +
+      `  IF ls_enq-garg CS '${name}'.\n` +
+      `    IF ls_enq-guname = sy-uname.\n` +
+      `      APPEND ls_enq TO lt_del.\n` +
+      `      out->write( |own stale lock: gname={ ls_enq-gname } garg={ ls_enq-garg }| ).\n` +
+      `    ELSE.\n` +
+      `      out->write( |HELD BY ANOTHER USER { ls_enq-guname }: gname={ ls_enq-gname } garg={ ls_enq-garg } - left untouched| ).\n` +
+      `    ENDIF.\n` +
+      `  ENDIF.\n` +
+      `ENDLOOP.\n` +
+      `IF lt_del IS INITIAL.\n` +
+      `  out->write( |no remaining enqueue entry for '${name}'| ).\n` +
+      `ELSE.\n` +
+      `  CALL FUNCTION 'ENQUEUE_DELETE'\n` +
+      `    EXPORTING\n` +
+      `      check_upd_requests = 1\n` +
+      `    IMPORTING\n` +
+      `      subrc              = lv_subrc\n` +
+      `    TABLES\n` +
+      `      enq                = lt_del.\n` +
+      `  out->write( |enqueue_delete: { lines( lt_del ) } entry/entries removed, subrc={ lv_subrc }| ).\n` +
+      `ENDIF.`;
+
+    // ENQUEUE_DELETE's TABLES parameter type is not identical across releases. If the rich variant
+    // fails to activate on this system, fall back to the DEQUEUE-only behaviour rather than
+    // leaving the user with no unlock at all.
+    try {
+      return await this.handleRun({
+        methodBody: `${dequeueBlock}\n${enqueueBlock}`,
+        className: 'ZCL_TMP_UNLOCK',
+      });
+    } catch (e: any) {
+      this.logger.info(
+        `abap_unlock: ENQUEUE_READ/DELETE variant did not run on this system (${e?.message || e}) — falling back to DEQUEUE only`
+      );
+      return this.handleRun({
+        methodBody:
+          `${dequeueBlock}\n` +
+          `out->write( |note: ENQUEUE_DELETE variant unavailable on this system - if the object stays blocked, clear it in SM12| ).`,
+        className: 'ZCL_TMP_UNLOCK',
+      });
+    }
   }
 
   private buildClassSource(className: string, methodBody: string, methodName: string): string {
@@ -347,12 +423,25 @@ ENDCLASS.`;
       this.fail(formatError('abap_run', error));
       throw error; // unreachable — this.fail() is `never`, but the finally block confuses TS control flow analysis
     } finally {
+      // Restore the stateful session UNCONDITIONALLY.
+      //
+      // This method switches the shared client to stateless for the classrun POST (see the
+      // logout/stateless block above). The restore used to live inside the `classCreated &&
+      // !keepClass` cleanup branch, so keepClass=true — and any early exit — left the client
+      // stateless for every later tool call. In stateless mode each HTTP request gets its own
+      // ICM session, so the next lock() returns a handle that is already dead: setObjectSource
+      // fails, the follow-up unLock fails too, and the enqueue entry is orphaned. The symptom is
+      // "object is locked by user <yourself>" on every subsequent write.
+      try {
+        this.adtclient.stateful = session_types.stateful;
+        await this.adtclient.login();
+      } catch (e: any) {
+        this.logger.info(`abap_run: stateful session could not be restored — ${e?.message || e}`);
+      }
+
       // Delete the temp class unless keepClass=true was requested.
-      // Re-login first — the session may be in a bad state after an error.
       if (classCreated && !opts.keepClass) {
         try {
-          this.adtclient.stateful = session_types.stateful;
-          await this.adtclient.login();
           const deleteLock = await this.adtclient.lock(classUrl);
           await this.adtclient.deleteObject(classUrl, deleteLock.LOCK_HANDLE);
         } catch (_) {
