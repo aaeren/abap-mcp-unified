@@ -225,6 +225,11 @@ Contributions are welcome. Please:
 
 MIT -- see [LICENSE](LICENSE).
 
+## Classic program tools, ABAP Unit, debugger
+
+`abap_unit_run`, `abap_textpool_read/write`, `abap_gui_status_read/write`, `abap_message_read/write` and the
+`debug_*` tools (breakpoints, listen, step, variables) — see [docs/classic-tools-and-debugger.md](docs/classic-tools-and-debugger.md).
+
 ## Multiple SAP systems, one server (runtime switching)
 
 Keep every system in ONE file outside your project repos — default `~/.sap-mcp/systems.json`

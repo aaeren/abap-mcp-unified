@@ -27,6 +27,8 @@ import { QualityHandlers }   from './handlers/QualityHandlers.js';
 import { GitHandlers }       from './handlers/GitHandlers.js';
 import { SystemHandlers }    from './handlers/SystemHandlers.js';
 import { DynproHandlers }    from './handlers/DynproHandlers.js';
+import { ClassicHandlers }   from './handlers/ClassicHandlers.js';
+import { DebugHandlers }     from './handlers/DebugHandlers.js';
 import { renderLoginPage, renderLoginSuccess } from './auth/loginPage.js';
 import { SystemDef, loadRegistry, initialSystem, findSystem, describeSystem, ENV_SYSTEM_NAME } from './lib/systems.js';
 
@@ -148,6 +150,8 @@ export class AbapAdtServer extends Server {
   private gitHandlers:       GitHandlers;
   private systemHandlers:    SystemHandlers;
   private dynproHandlers:    DynproHandlers;
+  private classicHandlers:   ClassicHandlers;
+  private debugHandlers:     DebugHandlers;
 
   /** objectUrl → LOCK_HANDLE for every lock this process currently holds. See trackLocks(). */
   private readonly heldLocks = new Map<string, string>();
@@ -178,6 +182,8 @@ export class AbapAdtServer extends Server {
     this.activeSystem = initial;
     this.sourceHandlers = this.objectHandlers = this.runHandlers = this.transportHandlers = undefined as any;
     this.dataHandlers = this.qualityHandlers = this.gitHandlers = this.systemHandlers = this.dynproHandlers = undefined as any;
+    this.classicHandlers = undefined as any;
+    this.debugHandlers = undefined as any;
     this.buildHandlers();
 
     this.setupHandlers();
@@ -206,6 +212,10 @@ export class AbapAdtServer extends Server {
     this.gitHandlers       = new GitHandlers(this.adtClient);
     this.systemHandlers    = new SystemHandlers(this.adtClient);
     this.dynproHandlers    = new DynproHandlers(this.adtClient, this.runHandlers);
+    this.classicHandlers   = new ClassicHandlers(this.adtClient, this.runHandlers);
+    // The debugger needs sessions of its own (listener/attach + an async trigger) on the same system.
+    const sys = this.activeSystem;
+    this.debugHandlers     = new DebugHandlers(this.adtClient, () => this.buildClient(sys), sys?.user || '');
 
     const elicitFn = (params: any) => this.elicitInput(params);
 
@@ -335,6 +345,7 @@ export class AbapAdtServer extends Server {
       this.sourceHandlers, this.objectHandlers, this.runHandlers,
       this.transportHandlers, this.dataHandlers, this.qualityHandlers,
       this.gitHandlers, this.systemHandlers, this.dynproHandlers,
+      this.classicHandlers, this.debugHandlers,
     ];
   }
 
@@ -442,6 +453,8 @@ export class AbapAdtServer extends Server {
    * to the enqueue table. That is why a lock can survive even after SM12 looks clean.
    */
   private async releaseSapSession(): Promise<void> {
+    // Debugger first: a listener or an attached debuggee left behind would keep catching the user's sessions.
+    try { await this.debugHandlers?.dispose(); } catch (_) { /* best-effort */ }
     if (this.heldLocks.size > 0) {
       // Re-login stateful first: the lock handles are only valid inside a live stateful session,
       // and whatever killed the previous one is often why we still hold these.
@@ -762,6 +775,13 @@ async function runHttp() {
 }
 
 // ─── Entry point ────────────────────────────────────────────────────────────
+
+// A long-lived server must survive a stray rejection from a background task (debugger listener,
+// async trigger, best-effort cleanup). Node would otherwise terminate the process and the client
+// would see every later tool call hang.
+process.on('unhandledRejection', (reason: any) => {
+  console.error(`[UNHANDLED REJECTION] ${reason?.stack || reason?.message || reason}`);
+});
 
 const mode = process.env.MCP_TRANSPORT || 'stdio';
 

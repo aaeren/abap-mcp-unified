@@ -1,13 +1,33 @@
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { BaseHandler } from './BaseHandler.js';
 import type { ToolDefinition } from '../types/tools.js';
-import { buildObjectUrl, buildSourceUrl, buildMethodUrl, NESTED_TYPES } from '../lib/urlBuilder.js';
+import { buildObjectUrl, buildSourceUrl, buildMethodUrl, NESTED_TYPES, buildPackageUrl } from '../lib/urlBuilder.js';
+import { summariseUnit } from './DebugHandlers.js';
 import { formatError } from '../lib/errors.js';
 import type { UsageReference } from 'abap-adt-api';
 
 export class QualityHandlers extends BaseHandler {
   getTools(): ToolDefinition[] {
     return [
+      {
+        name: 'abap_unit_run',
+        description:
+          'Run the ABAP Unit tests of an object (class with a test include, program, function group) or of a whole ' +
+          'package (type DEVC) and return a compact result: counts, and for every failed method the assertion ' +
+          'message, details and source position. Use after activation to verify changes; failed > 0 means the ' +
+          'change is not done. An object without test classes returns test_classes: 0 — that is "no tests", not a pass.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Object name, e.g. ZCL_MY_CLASS, or a package name with type DEVC' },
+            type: { type: 'string', description: 'Object type: CLAS, PROG/P, FUGR/F, DEVC' },
+            include_dangerous: { type: 'boolean', description: 'Also run tests with risk level dangerous/critical (default false — harmless only).' },
+            include_long: { type: 'boolean', description: 'Also run medium/long duration tests (default true).' },
+            only_failures: { type: 'boolean', description: 'Omit the per-method list of passed tests (default false).' }
+          },
+          required: ['name', 'type']
+        }
+      },
       {
         name: 'abap_syntax_check',
         annotations: { readOnlyHint: true },
@@ -108,12 +128,36 @@ export class QualityHandlers extends BaseHandler {
 
   async handle(toolName: string, args: any): Promise<any> {
     switch (toolName) {
+      case 'abap_unit_run':        return this.handleUnitRun(args);
       case 'abap_syntax_check':    return this.handleSyntaxCheck(args);
       case 'abap_atc_run':         return this.handleAtcRun(args);
       case 'abap_atc_variants':    return this.handleAtcVariants(args);
       case 'abap_where_used':      return this.handleWhereUsed(args);
       case 'abap_find_definition': return this.handleFindDefinition(args);
       default: throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${toolName}`);
+    }
+  }
+
+  private async handleUnitRun(args: any): Promise<any> {
+    if (!args.name || !args.type) {
+      this.fail('abap_unit_run requires name and type (e.g. CLAS, PROG/P, DEVC).');
+    }
+    try {
+      const type = String(args.type).toUpperCase();
+      const url = type.startsWith('DEVC') ? buildPackageUrl(args.name) : buildObjectUrl(args.name, args.type);
+      const dangerous = args.include_dangerous === true;
+      const long = args.include_long !== false;
+      const flags = { harmless: true, dangerous, critical: dangerous, short: true, medium: long, long };
+      const classes = await this.withSession(() => this.adtclient.unitTestRun(url, flags));
+      const summary = summariseUnit(classes as any[]);
+      if (args.only_failures === true) delete summary.classes;
+      return this.success({
+        name: String(args.name).toUpperCase(),
+        ...summary,
+        ...(summary.test_classes === 0 ? { note: 'No test classes found (or none within the selected risk/duration).' } : {}),
+      });
+    } catch (error: any) {
+      this.fail(formatError(`abap_unit_run(${args.name})`, error));
     }
   }
 

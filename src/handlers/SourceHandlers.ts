@@ -519,7 +519,15 @@ export class SourceHandlers extends BaseHandler {
       const r = await this.adtclient.lock(objectUrl);
       lockHandle = r.LOCK_HANDLE;
       try {
-        await this.adtclient.setObjectSource(sourceUrl, source, lockHandle!, transport);
+        try {
+          await this.adtclient.setObjectSource(sourceUrl, source, lockHandle!, transport);
+        } catch (first: any) {
+          // A class has no test include until one is created explicitly; writing to it then fails
+          // with "...CCAU does not have any inactive version". Create it and write again.
+          if (String(include_type).toLowerCase() !== 'testclasses') throw first;
+          await this.adtclient.createTestInclude(String(name).toLowerCase(), lockHandle!, transport);
+          await this.adtclient.setObjectSource(sourceUrl, source, lockHandle!, transport);
+        }
       } catch (err: any) {
         let unlockOk = false;
         try { await this.adtclient.unLock(objectUrl, lockHandle!); unlockOk = true; } catch (_) {}

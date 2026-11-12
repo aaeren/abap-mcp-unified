@@ -135,6 +135,9 @@ export class SystemHandlers extends BaseHandler {
       const { XMLParser } = await import('fast-xml-parser');
       const parser = new XMLParser({
         ignoreAttributes: false,
+        // Dump summaries are full of entities (&lt; &quot; …); the parser's default cap of 1000
+        // expansions fails the whole feed on a busy system.
+        processEntities: { enabled: true, maxTotalExpansions: 1000000, maxExpandedLength: 50000000 } as any,
         attributeNamePrefix: '@_',
         removeNSPrefix: true,
         isArray: (name) => name === 'entry' || name === 'category' || name === 'link'
