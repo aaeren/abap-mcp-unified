@@ -139,6 +139,7 @@ export class ObjectHandlers extends BaseHandler {
   // The library's createObject expects full subtypes (CLAS/OC, PROG/P, etc.)
   // but AIs often send just the short form. Map them automatically.
   private static readonly CREATE_TYPE_MAP: Record<string, string> = {
+    'STRU': 'TABL/DS',   // DDIC structure — the library only knows the TABL/DS subtype
     'CLAS': 'CLAS/OC', 'INTF': 'INTF/OI', 'PROG': 'PROG/P',
     'FUGR': 'FUGR/F', 'DDLS': 'DDLS/DF', 'DDLX': 'DDLX/EX',
     'TABL': 'TABL/DT', 'DTEL': 'DTEL/DE', 'DOMA': 'DOMA/DD',
