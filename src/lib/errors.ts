@@ -85,9 +85,14 @@ export function parseAdtError(error: any): AdtErrorInfo {
     isLocked:
       // Only true when another user/session holds the lock — not when a lock
       // fails due to object state (inconsistent, syntax errors, etc.)
+      // SAP's logon language (SAP_LANGUAGE) determines the message language — a Turkish-language
+      // logon (as used here) returns "...bloke edildi" ("...blocked") instead of the English
+      // "already locked" text, so both must be checked or the retry loop never triggers.
       (msg.includes('already locked') ||
        msg.includes('locked by user') ||
        msg.includes('locked by another') ||
+       msg.includes('bloke edildi') ||   // Turkish: "blocked" (object lock)
+       msg.includes('bloke ed') ||       // Turkish: covers other conjugations of "bloke etmek"
        // 'enqueue' alone is too broad — SAP uses it in activation-error messages too.
        // Only treat as a lock when enqueue failure implies another holder.
        (msg.includes('enqueue') && (msg.includes('user') || msg.includes('another') || msg.includes('hold')))
